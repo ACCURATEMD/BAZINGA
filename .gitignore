@@ -1,0 +1,23 @@
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Local settings and uploaded data
+.claude/
+/hosting-public/uploads/
+/public/uploads/
+/changes*.json
+/closed_jobs.json
+
+# Local archives and snapshots
+/.vscode.zip
+/index_live_prev_b7b75.html
+/index_old_base_with_shifts.html
+/public/index_backup.html
+/public/indexxx.html
+
+# Dependencies
+node_modules/
+functions/node_modules/

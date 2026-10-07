@@ -1,0 +1,10 @@
+node_modules
+functions/node_modules
+functions
+.git
+.firebase
+firebase-debug.log
+firestore-debug.log
+.vscode
+.claude
+*.zip
