@@ -734,6 +734,13 @@ body {
 .candidate-status.pending { background: var(--warning-light); color: #92400e; }
 .candidate-status.submitted { background: var(--primary-light); color: var(--primary); }
 
+/* Recommended: applicants the lobby app matched to this job (shift, pay,
+   location, skills). The badge is the match score out of 100. */
+.recommended-toggle { color: #7c3aed; }
+.recommended-chip { border-color: #ddd6fe; }
+.candidate-status.recommended { background: #ede9fe; color: #6d28d9; }
+.recommended-phone { margin-left: 0.25rem; color: var(--primary); text-decoration: none; font-size: 0.6875rem; }
+
 /* Opens an Outlook draft for this job - see openJobSubmitModal() */
 .job-submit-btn {
   display: inline-flex;
@@ -2087,6 +2094,7 @@ body {
         let clientsData = [];
         let closedJobsData = [];
         let bgRequirementOptions = [];
+        let recommendedByJob = {}; // jobId -> applicants the lobby app matched to that job
 
         let jobModalInstance;
         let clientModalInstance;
@@ -2278,6 +2286,7 @@ body {
             clientsData = state.clients || [];
             closedJobsData = state.closedJobs || [];
             bgRequirementOptions = state.bgRequirementOptions || [];
+            recommendedByJob = state.recommended || {};
             const loadingMsg = document.getElementById("loading-message");
             if (loadingMsg) loadingMsg.style.display = 'none';
             renderClients();
@@ -2289,6 +2298,7 @@ body {
             clientsData = state.clients || [];
             closedJobsData = state.closedJobs || [];
             bgRequirementOptions = state.bgRequirementOptions || [];
+            recommendedByJob = state.recommended || {};
             const openAccordionId = document.querySelector('#client-list .accordion-collapse.show')?.id;
             renderClients();
             renderClosedJobs();
@@ -2766,6 +2776,7 @@ body {
                                         }
                                         const spotsOpen = Math.max((job.needed || 1) - hiredCount, 0);
                                         const candidateCount = Array.isArray(job.candidates) ? job.candidates.length : 0;
+                                        const recommended = (job.id && recommendedByJob[job.id]) || [];
                                         const jobHighlight = (job.importantInformation || '').trim();
                                         
                                         // Simplified time display
@@ -2835,6 +2846,21 @@ body {
                                                         if (status.toLowerCase() === 'hired') statusClass = 'hired';
                                                         else if (status.includes('Submitted')) statusClass = 'submitted';
                                                         return `<span class="candidate-chip">${name}${status ? `<span class="candidate-status ${statusClass}">${status}</span>` : ''}</span>`;
+                                                    }).join('')}
+                                                </div>` : ''}
+                                                ${recommended.length > 0 ? `
+                                                <div class="candidates-bar">
+                                                    <button class="candidates-toggle recommended-toggle" onclick="toggleRecommendedList(this)">
+                                                        <i class="bi bi-stars"></i>
+                                                        ${recommended.length} recommended
+                                                        <i class="bi bi-chevron-down" style="font-size:0.625rem;"></i>
+                                                    </button>
+                                                </div>
+                                                <div class="candidates-list recommended-list">
+                                                    ${recommended.map((r) => {
+                                                        const tip = [r.phone, r.email, r.city, r.shiftPreference && ('Wants ' + r.shiftPreference + ' shift'), r.desiredPay, ...(r.reasons || [])]
+                                                            .filter(Boolean).join('\n');
+                                                        return `<span class="candidate-chip recommended-chip" title="${escapeAttr(tip)}">${escapeHtml(r.name || '')}<span class="candidate-status recommended">${Number(r.score) || 0}</span>${r.phone ? `<a href="tel:${escapeAttr(String(r.phone).replace(/[^\d+]/g, ''))}" class="recommended-phone">${escapeHtml(r.phone)}</a>` : ''}</span>`;
                                                     }).join('')}
                                                 </div>` : ''}
                                                 ${job.description ? `
@@ -4428,6 +4454,15 @@ body {
            ========================================================== */
 
         let submitCandidateModalInstance;
+
+        function toggleRecommendedList(button) {
+            const list = button.closest('.job-card')?.querySelector('.recommended-list');
+            if (list) list.classList.toggle('show');
+        }
+
+        // Recommended names come from applicants' own form entries, so they're
+        // escaped (escapeHtml) before going into the page.
+        const escapeAttr = escapeHtml;
 
         function toggleCandidatesList(button) {
             const list = button.closest('.job-card')?.querySelector('.candidates-list');
