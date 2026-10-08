@@ -49,3 +49,20 @@ gcloud projects add-iam-policy-binding bazingaopens \
   --member="serviceAccount:project-877472760654383082@appspot.gserviceaccount.com" \
   --role="roles/datastore.user"
 ```
+
+## Updating the list from a file
+
+`import-list.js` merges a job list (an array of clients in the `changes.json`
+format) into Firestore without replacing what is there. Nothing is deleted.
+
+```bash
+node import-list.js list.json                  # dry run: shows what would change
+node import-list.js list.json --apply --status # write it, and copy open/closed status
+```
+
+New clients and jobs are added, missing candidates are added to matching jobs,
+and empty client fields are filled in. With `--status`, a job's open/closed state
+is taken from the file. Before writing, the existing versions of every client it
+changes are saved to `bazinga-backup-<time>.json`. Stop BAZINGA first (the PC copy
+and the Cloud Run service) and start or redeploy it afterwards, because a running
+server keeps its own copy in memory.

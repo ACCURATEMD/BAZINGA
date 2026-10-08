@@ -21,3 +21,6 @@ ui-debug.log
 # Dependencies
 node_modules/
 functions/node_modules/
+
+# Import backups (contain client data)
+bazinga-backup-*.json
