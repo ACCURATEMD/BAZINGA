@@ -52,27 +52,19 @@ gcloud projects add-iam-policy-binding bazingaopens \
 
 ## Where the data lives
 
-The whole board is one Firestore document, **`appState/main`**, holding
-`clients` (each with its `jobs`), `closedJobs` and `bgRequirementOptions`. That
-is the same document the live board has always used, so this version and the
-live one read and write the same list and cannot drift apart. The lobby app
-reads it too, and writes its matches back to `bazingaRecommended`.
+The board lives in Firestore:
 
-On first start, if `appState/main` has no clients, the server takes over an
-older `bazingaClients` collection if one exists, and failing that seeds from
-`changes.json`. It also gives every client and job a stable `id` the first time
-it saves, which is what the lobby app uses to attach Recommended lists to the
-right job.
+- `bazingaClients/{clientId}`: one document per client, with its `jobs` and list `order`
+- `bazingaState/closedJobs`: the closed-jobs log; `bazingaState/settings`: background-requirement choices
+- `bazingaRecommended/{jobId}`: written by the lobby app, read here
 
-`changes.json` and `closed_jobs.json` are still written as local backups.
+`appState/main` is an older copy of the board from before this version (it
+stops at Oct 6, 2026). Nothing reads or writes it; leave it as a backup.
 
 ## Updating the list from a file
 
 `import-list.js` merges a job list (an array of clients in the `changes.json`
-format) into the older `bazingaClients` collection without replacing what is
-there. Nothing is deleted. Since the board now lives in `appState/main`,
-`--apply` refuses when that document holds the list; a dry run still works and
-is a quick way to compare the two.
+format) into `bazingaClients` without replacing what is there. Nothing is deleted.
 
 ```bash
 node import-list.js list.json                  # dry run: shows what would change

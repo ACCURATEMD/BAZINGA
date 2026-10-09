@@ -83,25 +83,21 @@ let recommendedByJob = {}; // jobId -> [recommended candidates], written by the 
 // copy of BAZINGA and readable by the lobby app, which matches applicants to
 // open jobs and writes them back as "Recommended":
 //
-//   appState/main               the whole board in one document:
-//                               { clients: [...], closedJobs: [...],
-//                                 bgRequirementOptions: [...] }
+//   bazingaClients/{clientId}   one client, its jobs array, and its list order
+//   bazingaState/closedJobs     { items: [...] }  the closed-jobs log
+//   bazingaState/settings       { bgRequirementOptions: [...] }
 //   bazingaRecommended/{jobId}  written by the lobby app; read-only here
 //
-// appState/main is the same document the live board has always used, so this
-// version and the live one read and write the same list and cannot drift apart.
-// On first start it takes over an older bazingaClients collection if that is
-// all there is, and failing that seeds from changes.json.
-//
-// changes.json / closed_jobs.json are still written as a local backup.
+// changes.json / closed_jobs.json are still written as a local backup, and
+// seed Firestore the first time this version starts against an empty database.
 // Credentials: on Cloud Run the service account is used automatically; on a
 // PC run `gcloud auth application-default login` once (see README).
 const db = new Firestore({
     projectId: process.env.FIRESTORE_PROJECT || 'bazingaopens',
     ignoreUndefinedProperties: true,
 });
-const stateDoc = db.collection('appState').doc('main');
-const legacyClientsCol = db.collection('bazingaClients');  // only read, on first start
+const clientsCol = db.collection('bazingaClients');
+const stateCol = db.collection('bazingaState');
 const recommendedCol = db.collection('bazingaRecommended');
 
 const newId = () => crypto.randomUUID();
@@ -119,38 +115,43 @@ function ensureIds(clients) {
     return clients;
 }
 
-// The board is one document, so a write goes out only when its content changed.
-let lastWritten = null; // the JSON last written to appState/main
+// Only clients whose content changed since the last write are written.
+const lastWritten = new Map(); // clientId -> JSON written
 let persistTimer = null;
 let persistChain = Promise.resolve();
 
 function schedulePersist() {
     clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
-        persistChain = persistChain.then(persistState).catch((err) => {
+        persistChain = persistChain.then(persistClients).catch((err) => {
             console.error('Error saving clients to Firestore:', err);
             io.emit('server_error', { message: 'Saving to the database failed. Your last change may not be saved.' });
         });
     }, 250);
 }
 
-// A Firestore document holds 1 MiB; warn well before that.
-const DOC_WARN_BYTES = 800 * 1024;
-
-async function persistState() {
-    const state = {
-        clients: currentData,
-        closedJobs: closedJobsData,
-        bgRequirementOptions,
-    };
-    const json = JSON.stringify(state);
-    if (json === lastWritten) return;
-    if (Buffer.byteLength(json) > DOC_WARN_BYTES) {
-        console.warn(`The board is ${Math.round(Buffer.byteLength(json) / 1024)} KB; a Firestore document holds 1024 KB. Close out old jobs or clear the closed-jobs log.`);
+async function persistClients() {
+    const batch = db.batch();
+    let writes = 0;
+    const seen = new Set();
+    currentData.forEach((client, order) => {
+        seen.add(client.id);
+        const json = JSON.stringify({ ...client, order });
+        if (lastWritten.get(client.id) === json) return;
+        batch.set(clientsCol.doc(client.id), { ...client, order });
+        lastWritten.set(client.id, json);
+        writes++;
+    });
+    for (const id of [...lastWritten.keys()]) {
+        if (seen.has(id)) continue;
+        batch.delete(clientsCol.doc(id));
+        lastWritten.delete(id);
+        writes++;
     }
-    await stateDoc.set(state);
-    lastWritten = json;
-    console.log(`Saved the board to Firestore (${currentData.length} clients, ${closedJobsData.length} closed jobs).`);
+    if (writes) {
+        await batch.commit();
+        console.log(`Saved ${writes} client change(s) to Firestore.`);
+    }
 }
 
 function writeBackup(file, data) {
@@ -176,13 +177,17 @@ function saveChanges(data) {
 // Saves the closed jobs data and broadcasts the full state
 function saveClosedJobsChanges(data) {
     closedJobsData = data; // Update server's in-memory state
-    schedulePersist();
+    stateCol.doc('closedJobs').set({ items: closedJobsData }).catch((err) => {
+        console.error('Error saving closed jobs to Firestore:', err);
+    });
     writeBackup(closedJobsFilePath, closedJobsData);
     broadcastState();
 }
 
 function saveSettings() {
-    schedulePersist();
+    stateCol.doc('settings').set({ bgRequirementOptions }).catch((err) => {
+        console.error('Error saving settings to Firestore:', err);
+    });
 }
 
 // --- Socket.IO Connection Handling ---
@@ -445,40 +450,36 @@ function readFileSafely(filePath, defaultValue) {
     return defaultValue;
 }
 
-// Load the board from appState/main. Failing that, take over an older
-// bazingaClients collection, and failing that seed from the local JSON files.
+// Load from Firestore; the first time, seed it from the local JSON files.
 async function loadState() {
-    const list = (v) => (Array.isArray(v) ? v : []);
-    const snap = await stateDoc.get();
-    const state = snap.exists ? snap.data() : null;
-
-    if (state && list(state.clients).length) {
-        currentData = list(state.clients);
-        closedJobsData = list(state.closedJobs);
-        bgRequirementOptions = list(state.bgRequirementOptions);
-        console.log(`Loaded ${currentData.length} clients from appState/main.`);
-        lastWritten = JSON.stringify({ clients: currentData, closedJobs: closedJobsData, bgRequirementOptions });
+    const snap = await clientsCol.orderBy('order').get();
+    if (!snap.empty) {
+        currentData = snap.docs.map((d) => {
+            const { order, ...client } = d.data();
+            lastWritten.set(d.id, JSON.stringify({ ...client, order }));
+            return client;
+        });
+        console.log(`Loaded ${currentData.length} clients from Firestore.`);
     } else {
-        const legacy = await legacyClientsCol.orderBy('order').get();
-        if (!legacy.empty) {
-            currentData = legacy.docs.map((d) => { const { order, ...client } = d.data(); return client; });
-            console.log(`appState/main is empty; taking over ${currentData.length} clients from the older bazingaClients collection.`);
-        } else {
-            currentData = readFileSafely(filePath, []);
-            if (!Array.isArray(currentData)) currentData = [];
-            console.log(`Firestore is empty; seeding it with ${currentData.length} clients from ${path.basename(filePath)}.`);
-        }
-        closedJobsData = list(state && state.closedJobs);
-        if (!closedJobsData.length) {
-            closedJobsData = readFileSafely(closedJobsFilePath, []);
-            if (!Array.isArray(closedJobsData)) closedJobsData = [];
-        }
-        bgRequirementOptions = list(state && state.bgRequirementOptions);
+        currentData = readFileSafely(filePath, []);
+        if (!Array.isArray(currentData)) currentData = [];
+        console.log(`Firestore is empty; seeding it with ${currentData.length} clients from ${path.basename(filePath)}.`);
     }
-
     const missingIds = currentData.some((c) => !c.id || (c.jobs || []).some((j) => !j.id));
     ensureIds(currentData);
-    if (lastWritten === null || missingIds) await persistState();
+    if (snap.empty || missingIds) await persistClients();
+
+    const closed = await stateCol.doc('closedJobs').get();
+    if (closed.exists) {
+        closedJobsData = closed.data().items || [];
+    } else {
+        closedJobsData = readFileSafely(closedJobsFilePath, []);
+        if (!Array.isArray(closedJobsData)) closedJobsData = [];
+        await stateCol.doc('closedJobs').set({ items: closedJobsData });
+    }
+
+    const settings = await stateCol.doc('settings').get();
+    bgRequirementOptions = (settings.exists && settings.data().bgRequirementOptions) || [];
 
     // Live: the lobby app rewrites these whenever its job pools change.
     recommendedCol.onSnapshot((rs) => {
