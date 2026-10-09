@@ -5,6 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors'); // Ensure you've installed this: npm install cors
 const multer = require('multer');
+const crypto = require('crypto');
+const { Firestore } = require('@google-cloud/firestore');
 
 const app = express();
 const server = http.createServer(app);
@@ -72,34 +74,119 @@ app.post('/upload', upload.single('document'), (req, res) => {
 
 let currentData = []; // Store the current client data in memory
 let closedJobsData = []; // Store closed jobs data in memory
+let bgRequirementOptions = []; // Custom background-requirement choices
+let recommendedByJob = {}; // jobId -> [recommended candidates], written by the lobby app
+
+// --- Firestore storage ---
+//
+// Clients (with their jobs) live in Firestore so the data is shared by every
+// copy of BAZINGA and readable by the lobby app, which matches applicants to
+// open jobs and writes them back as "Recommended":
+//
+//   bazingaClients/{clientId}   one client, its jobs array, and its list order
+//   bazingaState/closedJobs     { items: [...] }  the closed-jobs log
+//   bazingaState/settings       { bgRequirementOptions: [...] }
+//   bazingaRecommended/{jobId}  written by the lobby app; read-only here
+//
+// changes.json / closed_jobs.json are still written as a local backup, and
+// seed Firestore the first time this version starts against an empty database.
+// Credentials: on Cloud Run the service account is used automatically; on a
+// PC run `gcloud auth application-default login` once (see README).
+const db = new Firestore({
+    projectId: process.env.FIRESTORE_PROJECT || 'bazingaopens',
+    ignoreUndefinedProperties: true,
+});
+const clientsCol = db.collection('bazingaClients');
+const stateCol = db.collection('bazingaState');
+const recommendedCol = db.collection('bazingaRecommended');
+
+const newId = () => crypto.randomUUID();
+
+// Every client and job gets a stable id. Indices shift as clients and jobs are
+// added or removed; the id is what the lobby app uses to find a job again.
+function ensureIds(clients) {
+    for (const c of clients || []) {
+        if (!c || typeof c !== 'object') continue;
+        if (!c.id) c.id = newId();
+        for (const j of Array.isArray(c.jobs) ? c.jobs : []) {
+            if (j && typeof j === 'object' && !j.id) j.id = newId();
+        }
+    }
+    return clients;
+}
+
+// Only clients whose content changed since the last write are written.
+const lastWritten = new Map(); // clientId -> JSON written
+let persistTimer = null;
+let persistChain = Promise.resolve();
+
+function schedulePersist() {
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+        persistChain = persistChain.then(persistClients).catch((err) => {
+            console.error('Error saving clients to Firestore:', err);
+            io.emit('server_error', { message: 'Saving to the database failed. Your last change may not be saved.' });
+        });
+    }, 250);
+}
+
+async function persistClients() {
+    const batch = db.batch();
+    let writes = 0;
+    const seen = new Set();
+    currentData.forEach((client, order) => {
+        seen.add(client.id);
+        const json = JSON.stringify({ ...client, order });
+        if (lastWritten.get(client.id) === json) return;
+        batch.set(clientsCol.doc(client.id), { ...client, order });
+        lastWritten.set(client.id, json);
+        writes++;
+    });
+    for (const id of [...lastWritten.keys()]) {
+        if (seen.has(id)) continue;
+        batch.delete(clientsCol.doc(id));
+        lastWritten.delete(id);
+        writes++;
+    }
+    if (writes) {
+        await batch.commit();
+        console.log(`Saved ${writes} client change(s) to Firestore.`);
+    }
+}
+
+function writeBackup(file, data) {
+    fs.writeFile(file, JSON.stringify(data, null, 2), (err) => {
+        if (err) console.error('Error writing local backup', path.basename(file), err.message);
+    });
+}
+
+function broadcastState() {
+    io.emit('change', { clients: currentData, closedJobs: closedJobsData, bgRequirementOptions, recommended: recommendedByJob });
+}
 
 // --- Helper Functions for Saving and Broadcasting ---
 
 // Saves the current client data and broadcasts the full state
 function saveChanges(data) {
-    currentData = data; // Update server's in-memory state immediately
-    fs.writeFile(filePath, JSON.stringify(currentData, null, 2), (err) => {
-        if (err) {
-            console.error('Error saving client changes:', err);
-        } else {
-            console.log('Client changes saved to', filePath);
-            // Broadcast the combined state whenever clients change
-            io.emit('change', { clients: currentData, closedJobs: closedJobsData });
-        }
-    });
+    currentData = ensureIds(data); // Update server's in-memory state immediately
+    schedulePersist();
+    writeBackup(filePath, currentData);
+    broadcastState();
 }
 
 // Saves the closed jobs data and broadcasts the full state
 function saveClosedJobsChanges(data) {
     closedJobsData = data; // Update server's in-memory state
-    fs.writeFile(closedJobsFilePath, JSON.stringify(closedJobsData, null, 2), (err) => {
-        if (err) {
-            console.error('Error saving closed jobs changes:', err);
-        } else {
-            console.log('Closed jobs saved to', closedJobsFilePath);
-             // Broadcast the combined state whenever closed jobs change
-            io.emit('change', { clients: currentData, closedJobs: closedJobsData });
-        }
+    stateCol.doc('closedJobs').set({ items: closedJobsData }).catch((err) => {
+        console.error('Error saving closed jobs to Firestore:', err);
+    });
+    writeBackup(closedJobsFilePath, closedJobsData);
+    broadcastState();
+}
+
+function saveSettings() {
+    stateCol.doc('settings').set({ bgRequirementOptions }).catch((err) => {
+        console.error('Error saving settings to Firestore:', err);
     });
 }
 
@@ -108,7 +195,7 @@ io.on('connection', (socket) => {
     console.log('A user connected:', socket.id);
 
     // Send the current state (clients and closed jobs) to the newly connected client
-    socket.emit('initial_state', { clients: currentData, closedJobs: closedJobsData });
+    socket.emit('initial_state', { clients: currentData, closedJobs: closedJobsData, bgRequirementOptions, recommended: recommendedByJob });
 
     // --- Handle specific client actions ---
 
@@ -133,6 +220,7 @@ io.on('connection', (socket) => {
              currentData[clientIndex] = {
                  ...currentData[clientIndex], // Keep original properties like jobs
                  ...updatedClientData,        // Overwrite with new data
+                 id: currentData[clientIndex].id,
                  jobs: updatedClientData.jobs || originalJobs // Ensure jobs aren't lost if not sent
              };
             saveChanges(currentData);
@@ -164,6 +252,7 @@ io.on('connection', (socket) => {
              }
              const jobToAdd = {
                  ...job,
+                 id: newId(),
                  dateAdded: job.dateAdded || new Date().toISOString(),
                  closed: false
              };
@@ -182,6 +271,7 @@ io.on('connection', (socket) => {
             currentData[clientIndex].jobs[jobIndex] = {
                 ...originalJob,
                 ...updatedJob,
+                id: originalJob.id, // keep the job's identity (the lobby app keys Recommended by it)
                 // Allow closed to be updated if provided, otherwise preserve original
                 closed: (typeof updatedJob.closed !== 'undefined') ? updatedJob.closed : originalJob.closed
             };
@@ -274,6 +364,60 @@ io.on('connection', (socket) => {
         }
      });
 
+    socket.on('update_urgent', (payload) => {
+        const { clientIndex, urgent } = payload || {};
+        if (currentData && currentData[clientIndex]) {
+            currentData[clientIndex].urgent = !!urgent;
+            saveChanges(currentData);
+        } else {
+            console.error(`[${socket.id}] Invalid clientIndex (${clientIndex}) for update_urgent.`);
+        }
+    });
+
+    socket.on('add_bg_requirement_option', (option) => {
+        const value = String(option || '').trim();
+        if (!value || bgRequirementOptions.includes(value)) return;
+        bgRequirementOptions.push(value);
+        saveSettings();
+        broadcastState();
+    });
+
+    // Re-open jobs from the closed-jobs log: bump an open posting of the same
+    // position + shift, or add the job back as a new posting.
+    socket.on('reopen_jobs', (jobs) => {
+        let changed = false;
+        for (const job of Array.isArray(jobs) ? jobs : []) {
+            const client = currentData.find((c) => (c.name || '').toLowerCase() === (job.clientName || '').toLowerCase());
+            if (!client) {
+                console.warn(`[${socket.id}] Client "${job.clientName}" not found for reopen_jobs.`);
+                continue;
+            }
+            if (!Array.isArray(client.jobs)) client.jobs = [];
+            const open = client.jobs.find((j) => !j.closed &&
+                (j.position || '').toLowerCase() === (job.position || '').toLowerCase() &&
+                (j.shift || '').toLowerCase() === (job.shift || '').toLowerCase());
+            if (open) {
+                open.needed = (open.needed || 1) + 1;
+            } else {
+                client.jobs.push({
+                    id: newId(),
+                    position: job.position,
+                    shift: job.shift,
+                    needed: job.needed || 1,
+                    description: job.description,
+                    pay: job.pay || '',
+                    startTime: job.startTime || '',
+                    endTime: job.endTime || '',
+                    candidates: Array.isArray(job.candidates) ? job.candidates : [],
+                    dateAdded: new Date().toISOString(),
+                    closed: false,
+                });
+            }
+            changed = true;
+        }
+        if (changed) saveChanges(currentData);
+    });
+
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
     });
@@ -306,25 +450,52 @@ function readFileSafely(filePath, defaultValue) {
     return defaultValue;
 }
 
-// Read initial data safely
-currentData = readFileSafely(filePath, []);
-closedJobsData = readFileSafely(closedJobsFilePath, []);
+// Load from Firestore; the first time, seed it from the local JSON files.
+async function loadState() {
+    const snap = await clientsCol.orderBy('order').get();
+    if (!snap.empty) {
+        currentData = snap.docs.map((d) => {
+            const { order, ...client } = d.data();
+            lastWritten.set(d.id, JSON.stringify({ ...client, order }));
+            return client;
+        });
+        console.log(`Loaded ${currentData.length} clients from Firestore.`);
+    } else {
+        currentData = readFileSafely(filePath, []);
+        if (!Array.isArray(currentData)) currentData = [];
+        console.log(`Firestore is empty; seeding it with ${currentData.length} clients from ${path.basename(filePath)}.`);
+    }
+    const missingIds = currentData.some((c) => !c.id || (c.jobs || []).some((j) => !j.id));
+    ensureIds(currentData);
+    if (snap.empty || missingIds) await persistClients();
 
-// Ensure data is array
-if (!Array.isArray(currentData)) {
-    console.warn("Client data file was not an array, re-initializing.");
-    currentData = [];
-    fs.writeFileSync(filePath, JSON.stringify(currentData, null, 2));
+    const closed = await stateCol.doc('closedJobs').get();
+    if (closed.exists) {
+        closedJobsData = closed.data().items || [];
+    } else {
+        closedJobsData = readFileSafely(closedJobsFilePath, []);
+        if (!Array.isArray(closedJobsData)) closedJobsData = [];
+        await stateCol.doc('closedJobs').set({ items: closedJobsData });
+    }
+
+    const settings = await stateCol.doc('settings').get();
+    bgRequirementOptions = (settings.exists && settings.data().bgRequirementOptions) || [];
+
+    // Live: the lobby app rewrites these whenever its job pools change.
+    recommendedCol.onSnapshot((rs) => {
+        const next = {};
+        rs.forEach((d) => { next[d.id] = d.data().recommended || []; });
+        recommendedByJob = next;
+        broadcastState();
+    }, (err) => console.error('Listening for recommended candidates failed:', err.message));
 }
-if (!Array.isArray(closedJobsData)) {
-     console.warn("Closed jobs data file was not an array, re-initializing.");
-    closedJobsData = [];
-     fs.writeFileSync(closedJobsFilePath, JSON.stringify(closedJobsData, null, 2));
-}
 
-
-// Start the server
-server.listen(PORT, '0.0.0.0', () => {
+// Start the server once the data is loaded
+loadState().catch((err) => {
+    console.error('Could not load data from Firestore:', err.message);
+    console.error('On a PC, run "gcloud auth application-default login" once, then start BAZINGA again.');
+    process.exit(1);
+}).then(() => server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT}`);
     const { networkInterfaces } = require('os');
     const nets = networkInterfaces();
@@ -343,4 +514,4 @@ server.listen(PORT, '0.0.0.0', () => {
      } else {
         console.log(`Could not determine local IP address.`);
      }
-});
+}));
