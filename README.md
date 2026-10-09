@@ -58,11 +58,18 @@ format) into Firestore without replacing what is there. Nothing is deleted.
 ```bash
 node import-list.js list.json                  # dry run: shows what would change
 node import-list.js list.json --apply --status # write it, and copy open/closed status
+
+# or take the list straight from the live site's own saved data (collection appState):
+node import-list.js --from-appstate                    # dry run
+node import-list.js --from-appstate --apply --status    # write it
 ```
 
 New clients and jobs are added, missing candidates are added to matching jobs,
 and empty client fields are filled in. With `--status`, a job's open/closed state
-is taken from the file. Before writing, the existing versions of every client it
+is taken from the list. `--from-appstate` only reads the `appState` collection,
+never writes to it; it looks through every document there for a list of clients
+(stored as a list or as JSON text) and names them, so `--source
+appState/<doc>.<field>` can pick one when there is more than one. Before writing, the existing versions of every client it
 changes are saved to `bazinga-backup-<time>.json`. Stop BAZINGA first (the PC copy
 and the Cloud Run service) and start or redeploy it afterwards, because a running
 server keeps its own copy in memory.
