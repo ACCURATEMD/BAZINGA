@@ -2,6 +2,8 @@
 # Saves the BAZINGA code that was live before the 2026-10-09 deploy into
 # ~/bazinga-live.zip, taken from the Cloud Run revision that was running then.
 # Run it in Cloud Shell:  bash get-live-code.sh [cutoff-time]
+# It takes a few minutes (most of it downloading the old server image) and
+# downloads the zip to your computer at the end.
 #
 # It only reads: it lists the service's revisions and Hosting releases, pulls the
 # old revision's container image, and copies the app folder out of it. Nothing
@@ -15,7 +17,11 @@ REGION=us-central1
 SERVICE=bazinga-app
 CUTOFF=${1:-2026-10-09T01:16:00Z}   # newest revision created before this
 OUT=~/bazinga-live
+STEP="starting"
+trap 'echo; echo "Stopped during: $STEP. Paste everything above into the thread."' ERR
 
+STEP="1/5 listing server versions"
+echo "Step $STEP..."
 echo "== Cloud Run revisions (newest first) =="
 gcloud run revisions list --service "$SERVICE" --region "$REGION" --project "$PROJECT" \
     --format='table(metadata.name,metadata.creationTimestamp)' --limit=8
@@ -25,6 +31,8 @@ gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" 
     --format='value(status.traffic)' | tr ';' '\n'
 echo
 
+STEP="2/5 listing web page releases"
+echo "Step $STEP..."
 echo "== Hosting releases (newest first) =="
 TOKEN=$(gcloud auth print-access-token)
 curl -s -H "Authorization: Bearer $TOKEN" -H "x-goog-user-project: $PROJECT" \
@@ -36,16 +44,21 @@ for r in json.load(sys.stdin).get("releases", []):
 ' || echo "(could not list Hosting releases)"
 echo
 
+STEP="3/5 finding the version that was live before tonight"
+echo "Step $STEP..."
 REV=$(gcloud run revisions list --service "$SERVICE" --region "$REGION" --project "$PROJECT" \
     --format='value(metadata.name,metadata.creationTimestamp)' |
     awk -v c="$CUTOFF" '$2 < c' | sort -k2 | tail -1 | awk '{print $1}')
 if [ -z "$REV" ]; then echo "No revision was created before $CUTOFF."; exit 1; fi
 IMG=$(gcloud run revisions describe "$REV" --region "$REGION" --project "$PROJECT" --format='value(status.imageDigest)')
-echo "== Copying the code from $REV =="
+echo "Using $REV"
 echo "$IMG"
+echo
 
+STEP="4/5 downloading that version (a minute or two, let it run)"
+echo "Step $STEP..."
 gcloud auth configure-docker "${IMG%%/*}" --quiet >/dev/null 2>&1
-docker pull -q "$IMG" >/dev/null
+docker pull "$IMG"
 CID=$(docker create "$IMG")
 WD=""
 for d in "$(docker inspect -f '{{.Config.WorkingDir}}' "$IMG")" /app /workspace /usr/src/app; do
@@ -56,6 +69,8 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 docker cp "$CID:$WD/." "$OUT/"
 docker rm "$CID" >/dev/null
 
+STEP="5/5 making the zip"
+echo "Step $STEP..."
 rm -rf "$OUT/node_modules"
 find "$OUT" \( -name 'changes*.json' -o -name 'closed_jobs*.json' -o -iname '*key*.json' \
     -o -iname '*credential*' -o -iname '*service-account*' -o -name '.env*' \) -exec rm -rf {} + 2>/dev/null || true
@@ -68,4 +83,10 @@ echo
 echo "Files saved:"
 (cd "$OUT" && find . -type f | grep -v '/node_modules/' | sort | head -60)
 echo
-echo "Done: ~/bazinga-live.zip. Download it with:  cloudshell download ~/bazinga-live.zip"
+echo "Done: ~/bazinga-live.zip"
+trap - ERR
+if command -v cloudshell >/dev/null 2>&1; then
+    cloudshell download ~/bazinga-live.zip || echo "Download it with:  cloudshell download ~/bazinga-live.zip"
+else
+    echo "Download it with:  cloudshell download ~/bazinga-live.zip"
+fi
