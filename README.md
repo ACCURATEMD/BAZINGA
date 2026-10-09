@@ -50,10 +50,29 @@ gcloud projects add-iam-policy-binding bazingaopens \
   --role="roles/datastore.user"
 ```
 
+## Where the data lives
+
+The whole board is one Firestore document, **`appState/main`**, holding
+`clients` (each with its `jobs`), `closedJobs` and `bgRequirementOptions`. That
+is the same document the live board has always used, so this version and the
+live one read and write the same list and cannot drift apart. The lobby app
+reads it too, and writes its matches back to `bazingaRecommended`.
+
+On first start, if `appState/main` has no clients, the server takes over an
+older `bazingaClients` collection if one exists, and failing that seeds from
+`changes.json`. It also gives every client and job a stable `id` the first time
+it saves, which is what the lobby app uses to attach Recommended lists to the
+right job.
+
+`changes.json` and `closed_jobs.json` are still written as local backups.
+
 ## Updating the list from a file
 
 `import-list.js` merges a job list (an array of clients in the `changes.json`
-format) into Firestore without replacing what is there. Nothing is deleted.
+format) into the older `bazingaClients` collection without replacing what is
+there. Nothing is deleted. Since the board now lives in `appState/main`,
+`--apply` refuses when that document holds the list; a dry run still works and
+is a quick way to compare the two.
 
 ```bash
 node import-list.js list.json                  # dry run: shows what would change

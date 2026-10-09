@@ -17,6 +17,11 @@
 //     dispatch defaults, ...) are filled in; nothing already there is overwritten
 //   - with --status, a job's closed/open state (and close reason / date) is
 //     taken from the list when the two differ
+// NOTE: this tool writes into the bazingaClients collection, which is the older
+// layout. The board itself now lives in appState/main, so when that document
+// holds the list, --apply refuses rather than writing to a store nothing reads.
+// A dry run still works and is useful for comparing the two.
+//
 // --from-appstate only READS the appState collection (it never writes there), so
 // the live site can keep running while you copy. It looks through every document
 // in appState for a list of clients (each with a name and a jobs list), whether
@@ -49,6 +54,8 @@ if (!file && !FROM_APPSTATE) {
     console.error('   or: node import-list.js --from-appstate [--source appState/<doc>.<field>] [--apply] [--status]');
     process.exit(1);
 }
+
+const APP_STATE = 'main';
 
 const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 const jobKey = (j) => norm(j.position) + '|' + String(j.dateAdded || '').slice(0, 16);
@@ -213,6 +220,16 @@ async function main() {
     }
     console.log(`\nCandidates to add to existing jobs: ${out.addedCandidates}.  Empty client fields to fill: ${out.filledFields}.`);
     console.log(`Documents to write: ${writes.size} (${backups.size} existing clients changed, ${out.addedClients.length} new).`);
+
+    if (APPLY) {
+        const live = await db.collection('appState').doc(APP_STATE).get();
+        const liveClients = live.exists && Array.isArray(live.data().clients) ? live.data().clients : [];
+        if (liveClients.length) {
+            console.log(`\nNot writing: the board itself lives in appState/${APP_STATE} (${liveClients.length} clients), and this tool writes to the older bazingaClients collection, which nothing reads any more.`);
+            console.log('Make the change in BAZINGA itself, or ask for a version of this tool that merges into appState.');
+            return;
+        }
+    }
 
     if (!APPLY) {
         console.log('\nDry run: nothing was written. Stop BAZINGA, then run again with --apply to make these changes.');
